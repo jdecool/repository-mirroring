@@ -13,6 +13,11 @@
 # it is already archived on the Codeberg side, it is always unarchived
 # before syncing (otherwise the push fails).
 #
+# Releases are also synchronized: GitHub releases (metadata and assets)
+# are replicated to Codeberg, with draft releases skipped and orphaned
+# Codeberg releases deleted. This can be controlled via SYNC_RELEASES and
+# SYNC_RELEASE_ASSETS environment variables.
+#
 # Usage:
 #   ./sync-github-to-codeberg.sh [--dry-run] [--limit N] [--repo owner/repo]...
 #
@@ -73,6 +78,10 @@ if [[ -f "$SCRIPT_DIR/../.env" ]]; then
 fi
 
 CODEBERG_API="${CODEBERG_API:-https://codeberg.org/api/v1}"
+
+# Release sync configuration (defaults: both enabled)
+SYNC_RELEASES="${SYNC_RELEASES:-true}"
+SYNC_RELEASE_ASSETS="${SYNC_RELEASE_ASSETS:-true}"
 
 log()  { printf '%s\n' "$*"; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
@@ -176,6 +185,621 @@ patch_description() {
     -d "$payload"
 }
 
+# ---------------------------------------------------------------------------
+# API Helper Functions
+# ---------------------------------------------------------------------------
+
+# Generic GitHub API caller
+# Usage: gh_api GET /repos/owner/repo/releases
+#        gh_api POST /repos/owner/repo/releases -d '{"tag_name":"v1"}'
+gh_api() {
+  local method="$1" path="$2"
+  shift 2
+  curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -X "$method" "https://api.github.com${path}" "$@"
+}
+
+# Generic Codeberg API caller (returns HTTP status code)
+# Usage: cb_api_status GET /repos/user/repo/releases
+#        cb_api_status POST /repos/user/repo/releases -d '{"tag_name":"v1"}'
+cb_api_status() {
+  local method="$1" path="$2"
+  shift 2
+  curl -s -o "$WORKDIR/cb_resp_body.json" -w '%{http_code}' \
+    -H "Authorization: token ${CODEBERG_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -X "$method" "$CODEBERG_API${path}" "$@"
+}
+
+# Codeberg API caller that returns JSON body
+# Usage: cb_api GET /repos/user/repo/releases
+cb_api() {
+  local method="$1" path="$2"
+  shift 2
+  local status
+  status="$(cb_api_status "$method" "$path" "$@")"
+  if [[ "$status" != "200" && "$status" != "201" && "$status" != "204" ]]; then
+    return 1
+  fi
+  cat "$WORKDIR/cb_resp_body.json"
+}
+
+# ---------------------------------------------------------------------------
+# Release Synchronization Functions
+# ---------------------------------------------------------------------------
+
+# Fetch all releases from GitHub for a repository
+# Returns JSON array of published (non-draft) releases
+fetch_github_releases() {
+  local owner="$1" repo="$2"
+  local page=1
+  local all_releases="[]"
+  local per_page=100
+
+  while true; do
+    local response
+    response="$(gh_api GET "/repos/${owner}/${repo}/releases?per_page=${per_page}&page=${page}")"
+    
+    # Check for errors
+    if [[ -z "$response" ]]; then
+      err "Failed to fetch GitHub releases for ${owner}/${repo}"
+      return 1
+    fi
+    
+    # Check for rate limiting
+    local rate_remaining
+    rate_remaining="$(jq -r '.message' <<<"$response" 2>/dev/null || true)"
+    if [[ "$rate_remaining" == *"rate limit"* ]]; then
+      err "GitHub rate limit exceeded: $rate_remaining"
+      return 1
+    fi
+    
+    # Filter out draft releases and add to collection
+    local page_releases
+    page_releases="$(jq '[.[] | select(.draft == false)]' <<<"$response")"
+    all_releases="$(jq --argjson existing "$all_releases" --argjson new "$page_releases" '$existing + $new' <<<"$all_releases")"
+    
+    # Check if there are more pages
+    local link_header
+    link_header="$(gh_api HEAD "/repos/${owner}/${repo}/releases?per_page=${per_page}&page=${page}" 2>/dev/null | grep -i 'link:' | head -1 || true)"
+    if [[ -z "$link_header" || "$link_header" != *"rel=\"next\""* ]]; then
+      break
+    fi
+    
+    page=$((page + 1))
+  done
+  
+  echo "$all_releases"
+}
+
+# Fetch all releases from Codeberg for a repository
+# Returns JSON array of releases
+fetch_codeberg_releases() {
+  local repo_name="$1"
+  local page=1
+  local all_releases="[]"
+  local per_page=100
+
+  while true; do
+    local status
+    status="$(cb_api_status GET "/repos/${CODEBERG_USER}/${repo_name}/releases?per_page=${per_page}&page=${page}")"
+    
+    if [[ "$status" == "200" ]]; then
+      local page_releases
+      page_releases="$(cat "$WORKDIR/cb_resp_body.json")"
+      all_releases="$(jq --argjson existing "$all_releases" --argjson new "$page_releases" '$existing + $new' <<<"$all_releases")"
+      
+      # Check for pagination in Link header (Forgejo may not support it, but be safe)
+      # For now, just check if we got fewer than per_page items
+      local count
+      count="$(jq 'length' <<<"$page_releases")"
+      if [[ "$count" -lt "$per_page" ]]; then
+        break
+      fi
+      page=$((page + 1))
+    else
+      # No releases or error - return what we have
+      break
+    fi
+  done
+  
+  echo "$all_releases"
+}
+
+# Create a release on Codeberg
+# $1: repo_name, $2: tag_name, $3: name, $4: body, $5: prerelease (true/false)
+# Returns the created release JSON or empty on error
+create_codeberg_release() {
+  local repo_name="$1" tag_name="$2" name="$3" body="$4" prerelease="$5"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would create Codeberg release: tag=$tag_name name=$name"
+    return 0
+  fi
+  
+  local payload
+  payload="$(jq -n \
+    --arg tag_name "$tag_name" \
+    --arg name "$name" \
+    --arg body "$body" \
+    --argjson prerelease "$prerelease" \
+    '{tag_name: $tag_name, name: $name, body: $body, prerelease: $prerelease}')"
+  
+  local status
+  status="$(cb_api_status POST "/repos/${CODEBERG_USER}/${repo_name}/releases" \
+    -H 'Content-Type: application/json' \
+    -d "$payload")"
+  
+  if [[ "$status" == "201" ]]; then
+    cat "$WORKDIR/cb_resp_body.json"
+    return 0
+  else
+    err "  Failed to create Codeberg release (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+}
+
+# Update a release on Codeberg
+# $1: repo_name, $2: release_id, $3: name, $4: body, $5: prerelease (true/false)
+# Returns 0 on success, 1 on error
+update_codeberg_release() {
+  local repo_name="$1" release_id="$2" name="$3" body="$4" prerelease="$5"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would update Codeberg release $release_id: name=$name"
+    return 0
+  fi
+  
+  local payload
+  payload="$(jq -n \
+    --arg name "$name" \
+    --arg body "$body" \
+    --argjson prerelease "$prerelease" \
+    '{name: $name, body: $body, prerelease: $prerelease}')"
+  
+  local status
+  status="$(cb_api_status PATCH "/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}" \
+    -H 'Content-Type: application/json' \
+    -d "$payload")"
+  
+  if [[ "$status" == "200" ]]; then
+    return 0
+  else
+    err "  Failed to update Codeberg release $release_id (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+}
+
+# Delete a release on Codeberg
+# $1: repo_name, $2: release_id
+# Returns 0 on success, 1 on error
+delete_codeberg_release() {
+  local repo_name="$1" release_id="$2"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would delete Codeberg release $release_id"
+    return 0
+  fi
+  
+  local status
+  status="$(cb_api_status DELETE "/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}")"
+  
+  if [[ "$status" == "204" ]]; then
+    return 0
+  else
+    err "  Failed to delete Codeberg release $release_id (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+}
+
+# Enable releases feature on Codeberg repository
+# $1: repo_name
+# Returns 0 on success, 1 on error
+ensure_releases_enabled() {
+  local repo_name="$1"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would check/enable releases feature"
+    return 0
+  fi
+  
+  # Check current repository features
+  local status
+  status="$(cb_api_status GET "/repos/${CODEBERG_USER}/${repo_name}")"
+  
+  if [[ "$status" != "200" ]]; then
+    err "  Failed to check Codeberg repository (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+  
+  local has_releases
+  has_releases="$(jq -r '.has_releases // false' <<<"$(cat "$WORKDIR/cb_resp_body.json")")"
+  
+  if [[ "$has_releases" == "true" ]]; then
+    return 0
+  fi
+  
+  log "  Enabling releases feature on Codeberg repository..."
+  
+  local payload
+  payload="$(jq -n '{has_releases: true}')"
+  
+  status="$(cb_api_status PATCH "/repos/${CODEBERG_USER}/${repo_name}" \
+    -H 'Content-Type: application/json' \
+    -d "$payload")"
+  
+  if [[ "$status" == "200" ]]; then
+    log "  Releases feature enabled on Codeberg"
+    return 0
+  else
+    err "  Failed to enable releases feature (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+}
+
+# Sync assets for a release
+# $1: gh_owner, $2: gh_repo, $3: gh_release_id, $4: cb_repo, $5: cb_release_id
+sync_release_assets() {
+  local gh_owner="$1" gh_repo="$2" gh_release_id="$3"
+  local cb_repo="$4" cb_release_id="$5"
+  
+  if [[ "${SYNC_RELEASE_ASSETS:-true}" != "true" ]]; then
+    log "  Asset sync disabled, skipping"
+    return 0
+  fi
+  
+  log "  Syncing assets for release..."
+  
+  # Fetch GitHub assets
+  local gh_assets
+  gh_assets="$(gh_api GET "/repos/${gh_owner}/${gh_repo}/releases/${gh_release_id}/assets")"
+  
+  if [[ -z "$gh_assets" || "$gh_assets" == "[]" ]]; then
+    log "  No GitHub assets to sync"
+    # Check if Codeberg has assets to delete
+    local cb_assets
+    cb_assets="$(cb_api GET "/repos/${CODEBERG_USER}/${cb_repo}/releases/${cb_release_id}/assets" 2>/dev/null || echo "[]")"
+    
+    if [[ "$cb_assets" != "[]" ]]; then
+      local cb_asset_count
+      cb_asset_count="$(jq 'length' <<<"$cb_assets")"
+      log "  Deleting $cb_asset_count orphaned assets from Codeberg..."
+      
+      local asset_ids
+      asset_ids="$(jq -r '.[].id' <<<"$cb_assets")"
+      
+      for asset_id in $asset_ids; do
+        if ! delete_codeberg_release_asset "$cb_repo" "$asset_id"; then
+          return 1
+        fi
+      done
+    fi
+    return 0
+  fi
+  
+  # Fetch Codeberg assets
+  local cb_assets
+  cb_assets="$(cb_api GET "/repos/${CODEBERG_USER}/${cb_repo}/releases/${cb_release_id}/assets" 2>/dev/null || echo "[]")"
+  
+  # Build map of Codeberg assets by name
+  local cb_asset_names
+  cb_asset_names="$(jq -r '[.[].name] | unique | .[]' <<<"$cb_assets" 2>/dev/null || echo "")"
+  
+  # Process each GitHub asset
+  local gh_asset_count
+  gh_asset_count="$(jq 'length' <<<"$gh_assets")"
+  local processed=0
+  
+  while IFS= read -r gh_asset; do
+    if [[ -z "$gh_asset" ]]; then continue; fi
+    
+    local gh_asset_name
+    gh_asset_name="$(jq -r '.name' <<<"$gh_asset")"
+    local gh_asset_id
+    gh_asset_id="$(jq -r '.id' <<<"$gh_asset")"
+    local gh_asset_url
+    gh_asset_url="$(jq -r '.url' <<<"$gh_asset")"
+    
+    # Check if asset exists on Codeberg
+    if grep -qxF "$gh_asset_name" <<<"$cb_asset_names" 2>/dev/null; then
+      log "  Asset '$gh_asset_name' already exists on Codeberg, skipping"
+    else
+      log "  Uploading asset '$gh_asset_name' to Codeberg..."
+      
+      # Download from GitHub
+      local temp_file="$WORKDIR/asset_${gh_asset_id}_${gh_asset_name}"
+      if ! download_github_asset "$gh_owner" "$gh_repo" "$gh_asset_id" "$temp_file"; then
+        err "  Failed to download asset '$gh_asset_name'"
+        return 1
+      fi
+      
+      # Upload to Codeberg
+      if ! upload_codeberg_asset "$cb_repo" "$cb_release_id" "$gh_asset_name" "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+      fi
+      
+      rm -f "$temp_file"
+    fi
+    
+    processed=$((processed + 1))
+  done < <(jq -c '.[]' <<<"$gh_assets")
+  
+  # Delete orphaned Codeberg assets (those not on GitHub)
+  while IFS= read -r cb_asset; do
+    if [[ -z "$cb_asset" ]]; then continue; fi
+    
+    local cb_asset_name
+    cb_asset_name="$(jq -r '.name' <<<"$cb_asset")"
+    local cb_asset_id
+    cb_asset_id="$(jq -r '.id' <<<"$cb_asset")"
+    
+    # Check if this asset exists on GitHub
+    if ! jq -e --arg name "$cb_asset_name" 'any(.[]; .name == $name)' <<<"$gh_assets" >/dev/null 2>&1; then
+      log "  Deleting orphaned asset '$cb_asset_name' from Codeberg..."
+      if ! delete_codeberg_release_asset "$cb_repo" "$cb_asset_id"; then
+        return 1
+      fi
+    fi
+  done < <(jq -c '.[]' <<<"$cb_assets")
+  
+  return 0
+}
+
+# Download a release asset from GitHub
+# $1: owner, $2: repo, $3: asset_id, $4: output_file
+download_github_asset() {
+  local owner="$1" repo="$2" asset_id="$3" output_file="$4"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would download asset $asset_id to $output_file"
+    touch "$output_file"
+    return 0
+  fi
+  
+  # Use the GitHub API to get the download URL
+  local asset_info
+  asset_info="$(gh_api GET "/repos/${owner}/${repo}/releases/assets/${asset_id}")"
+  
+  if [[ -z "$asset_info" ]]; then
+    err "  Failed to get asset info from GitHub"
+    return 1
+  fi
+  
+  local download_url
+  download_url="$(jq -r '.browser_download_url' <<<"$asset_info")"
+  
+  if [[ "$download_url" == "null" || -z "$download_url" ]]; then
+    err "  No download URL for asset $asset_id"
+    return 1
+  fi
+  
+  # Download with authentication
+  local status
+  status="$(curl -s -w '%{http_code}' -L \
+    -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/octet-stream" \
+    -o "$output_file" \
+    "$download_url")"
+  
+  if [[ "$status" != "200" ]]; then
+    rm -f "$output_file"
+    err "  Failed to download asset (HTTP $status)"
+    return 1
+  fi
+  
+  return 0
+}
+
+# Upload a release asset to Codeberg
+# $1: repo_name, $2: release_id, $3: asset_name, $4: file_path
+upload_codeberg_asset() {
+  local repo_name="$1" release_id="$2" asset_name="$3" file_path="$4"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would upload asset '$asset_name' to Codeberg"
+    return 0
+  fi
+  
+  local status
+  # Note: Forgejo/Codeberg uses different endpoint for asset upload
+  # It's POST /repos/{owner}/{repo}/releases/{id}/assets with multipart form
+  # But the asset name needs to be in the URL as a query parameter
+  
+  # First, try the standard way - some Forgejo versions use different endpoints
+  # Try: POST /repos/{owner}/{repo}/releases/{id}/assets?name={name}
+  local url="${CODEBERG_API}/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}/assets?name=${asset_name}"
+  
+  status="$(curl -s -w '%{http_code}' \
+    -H "Authorization: token ${CODEBERG_TOKEN}" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@${file_path}" \
+    "$url")"
+  
+  if [[ "$status" == "201" ]]; then
+    return 0
+  fi
+  
+  # If that didn't work, try without the name parameter
+  # Some versions expect the filename from the Content-Disposition header
+  status="$(curl -s -w '%{http_code}' \
+    -H "Authorization: token ${CODEBERG_TOKEN}" \
+    -H "Content-Type: application/octet-stream" \
+    -H "Content-Disposition: attachment; filename=\"${asset_name}\"" \
+    --data-binary "@${file_path}" \
+    "${CODEBERG_API}/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}/assets")"
+  
+  if [[ "$status" == "201" ]]; then
+    return 0
+  fi
+  
+  err "  Failed to upload asset '$asset_name' (HTTP $status)"
+  return 1
+}
+
+# Delete a release asset from Codeberg
+# $1: repo_name, $2: asset_id
+delete_codeberg_release_asset() {
+  local repo_name="$1" asset_id="$2"
+  
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "  [dry-run] Would delete Codeberg asset $asset_id"
+    return 0
+  fi
+  
+  local status
+  status="$(cb_api_status DELETE "/repos/${CODEBERG_USER}/${repo_name}/releases/assets/${asset_id}")"
+  
+  if [[ "$status" == "204" ]]; then
+    return 0
+  else
+    err "  Failed to delete Codeberg asset $asset_id (HTTP $status): $(cat "$WORKDIR/cb_resp_body.json")"
+    return 1
+  fi
+}
+
+# Main release sync function
+# $1: repo_name, $2: owner
+sync_releases() {
+  local repo_name="$1" owner="$2"
+  
+  log "  Syncing releases..."
+  
+  # Ensure releases feature is enabled on Codeberg
+  if ! ensure_releases_enabled "$repo_name"; then
+    err "  Cannot sync releases: releases feature not available on Codeberg"
+    return 1
+  fi
+  
+  # Fetch GitHub releases (published only)
+  local gh_releases
+  if ! gh_releases="$(fetch_github_releases "$owner" "$repo_name")"; then
+    err "  Failed to fetch GitHub releases"
+    return 1
+  fi
+  
+  # Fetch Codeberg releases
+  local cb_releases
+  cb_releases="$(fetch_codeberg_releases "$repo_name")"
+  
+  # Build map by tag_name for Codeberg releases
+  local cb_by_tag="{}"
+  if [[ "$cb_releases" != "[]" ]]; then
+    cb_by_tag="$(jq -c 'map({(.tag_name): .}) | add // {}' <<<"$cb_releases")"
+  fi
+  
+  # Process GitHub releases
+  local gh_count=0 cb_count=0 created=0 updated=0 deleted=0
+  gh_count="$(jq 'length' <<<"$gh_releases")"
+  cb_count="$(jq 'length' <<<"$cb_releases")"
+  
+  log "  GitHub: $gh_count published releases, Codeberg: $cb_count releases"
+  
+  # First pass: create/update releases from GitHub
+  while IFS= read -r gh_release; do
+    if [[ -z "$gh_release" ]]; then continue; fi
+    
+    local tag_name
+    tag_name="$(jq -r '.tag_name' <<<"$gh_release")"
+    local name
+    name="$(jq -r '.name // ""' <<<"$gh_release")"
+    local body
+    body="$(jq -r '.body // ""' <<<"$gh_release")"
+    local prerelease
+    prerelease="$(jq -r '.prerelease // false' <<<"$gh_release")"
+    local gh_release_id
+    gh_release_id="$(jq -r '.id' <<<"$gh_release")"
+    
+    # Check if release exists on Codeberg
+    local cb_release
+    cb_release="$(jq -r --arg tag "$tag_name" '.[$tag] // empty' <<<"$cb_by_tag")"
+    
+    if [[ -z "$cb_release" ]]; then
+      # Create new release on Codeberg
+      log "  Creating release: $tag_name"
+      local new_release
+      if ! new_release="$(create_codeberg_release "$repo_name" "$tag_name" "$name" "$body" "$prerelease")"; then
+        return 1
+      fi
+      
+      local new_cb_release_id
+      new_cb_release_id="$(jq -r '.id' <<<"$new_release")"
+      
+      # Sync assets
+      if [[ "${SYNC_RELEASE_ASSETS:-true}" == "true" ]]; then
+        if ! sync_release_assets "$owner" "$repo_name" "$gh_release_id" "$repo_name" "$new_cb_release_id"; then
+          err "  Failed to sync assets for release $tag_name"
+          # Continue, don't fail the whole sync
+        fi
+      fi
+      
+      created=$((created + 1))
+    else
+      # Update existing release
+      local cb_release_id
+      cb_release_id="$(jq -r '.id' <<<"$cb_release")"
+      local cb_name
+      cb_name="$(jq -r '.name // ""' <<<"$cb_release")"
+      local cb_body
+      cb_body="$(jq -r '.body // ""' <<<"$cb_release")"
+      local cb_prerelease
+      cb_prerelease="$(jq -r '.prerelease // false' <<<"$cb_release")"
+      
+      # Check if update is needed
+      local needs_update=false
+      [[ "$name" != "$cb_name" ]] && needs_update=true
+      [[ "$body" != "$cb_body" ]] && needs_update=true
+      [[ "$prerelease" != "$cb_prerelease" ]] && needs_update=true
+      
+      if [[ "$needs_update" == "true" ]]; then
+        log "  Updating release: $tag_name"
+        if ! update_codeberg_release "$repo_name" "$cb_release_id" "$name" "$body" "$prerelease"; then
+          return 1
+        fi
+        updated=$((updated + 1))
+      else
+        log "  Release $tag_name already up to date"
+      fi
+      
+      # Sync assets
+      if [[ "${SYNC_RELEASE_ASSETS:-true}" == "true" ]]; then
+        if ! sync_release_assets "$owner" "$repo_name" "$gh_release_id" "$repo_name" "$cb_release_id"; then
+          err "  Failed to sync assets for release $tag_name"
+        fi
+      fi
+    fi
+    
+    # Mark this tag as processed
+    cb_by_tag="$(jq --arg tag "$tag_name" 'del(.[$tag])' <<<"$cb_by_tag")"
+  done < <(jq -c '.[]' <<<"$gh_releases")
+  
+  # Second pass: delete orphaned releases on Codeberg
+  # cb_by_tag now contains only releases not on GitHub
+  local orphan_count
+  orphan_count="$(jq 'length' <<<"$cb_by_tag")"
+  
+  if [[ "$orphan_count" -gt 0 ]]; then
+    log "  Deleting $orphan_count orphaned releases from Codeberg..."
+    
+    for tag_name in $(jq -r 'keys[]' <<<"$cb_by_tag"); do
+      local cb_release
+      cb_release="$(jq -r --arg tag "$tag_name" '.[$tag]' <<<"$cb_by_tag")"
+      local cb_release_id
+      cb_release_id="$(jq -r '.id' <<<"$cb_release")"
+      
+      log "  Deleting orphaned release: $tag_name"
+      if ! delete_codeberg_release "$repo_name" "$cb_release_id"; then
+        return 1
+      fi
+      deleted=$((deleted + 1))
+    done
+  fi
+  
+  log "  Release sync complete: $created created, $updated updated, $deleted deleted"
+  return 0
+}
+
 index=0
 while IFS= read -r repo_json; do
   index=$((index + 1))
@@ -230,6 +854,7 @@ while IFS= read -r repo_json; do
     [[ "$needs_description_update" -eq 1 ]] && log "  [dry-run] description update skipped."
     log "  [dry-run] clone/push skipped."
     [[ "$is_archived" == "true" ]] && log "  [dry-run] re-archiving skipped."
+    [[ "${SYNC_RELEASES:-true}" == "true" ]] && log "  [dry-run] release sync skipped."
     successes=$((successes + 1))
     continue
   fi
@@ -286,6 +911,16 @@ while IFS= read -r repo_json; do
   fi
 
   rm -rf "$mirror_dir"
+
+  # --- 4b. Sync releases if enabled ---------------------------------------------
+  if [[ "${SYNC_RELEASES:-true}" == "true" ]]; then
+    owner="$(jq -r '.nameWithOwner' <<<"$repo_json" | cut -d/ -f1)"
+    if ! sync_releases "$name" "$owner"; then
+      err "  Release sync failed for $name_with_owner"
+      failures+=("$name_with_owner (release sync)")
+      continue
+    fi
+  fi
 
   # --- 5. Re-archive if the GitHub repository is archived ----------------------
   if [[ "$is_archived" == "true" ]]; then
