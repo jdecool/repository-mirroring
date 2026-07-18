@@ -14,7 +14,7 @@
 # before syncing (otherwise the push fails).
 #
 # Usage:
-#   ./sync-github-to-codeberg.sh [--dry-run] [--limit N]
+#   ./sync-github-to-codeberg.sh [--dry-run] [--limit N] [--repo owner/repo]...
 #
 # Configuration: see .env.example (copy to .env and fill in the values).
 
@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # ---------------------------------------------------------------------------
 DRY_RUN=0
 LIMIT=0
+REPOS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +38,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --limit)
       LIMIT="${2:?"--limit requires a value"}"
+      shift 2
+      ;;
+    --repo)
+      REPOS+=("${2:?"--repo requires a value"}")
       shift 2
       ;;
     -h|--help)
@@ -111,8 +116,21 @@ trap cleanup EXIT
 # Fetch the list of GitHub repositories (personal, non-forks)
 # ---------------------------------------------------------------------------
 log "Fetching the list of GitHub repositories..."
-repos_json="$(gh repo list --source --limit 1000 \
-  --json nameWithOwner,name,isFork,isArchived,isPrivate,description)"
+if [[ ${#REPOS[@]} -gt 0 ]]; then
+  repos_json="[]"
+  for repo_spec in "${REPOS[@]}"; do
+    repo_json="$(gh repo view "$repo_spec" \
+      --json nameWithOwner,name,isFork,isArchived,isPrivate,description 2>/dev/null || true)"
+    if [[ -z "$repo_json" ]]; then
+      err "Repository '$repo_spec' not found or inaccessible"
+      exit 1
+    fi
+    repos_json="$(jq --argjson r "$repo_json" '. + [$r]' <<<"$repos_json")"
+  done
+else
+  repos_json="$(gh repo list --source --limit 1000 \
+    --json nameWithOwner,name,isFork,isArchived,isPrivate,description)"
+fi
 
 # Safety filter (gh --source should already exclude forks)
 filtered_json="$(jq -c '[.[] | select(.isFork == false)]' <<<"$repos_json")"
