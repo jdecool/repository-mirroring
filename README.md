@@ -4,6 +4,8 @@ Bash script to replicate all of your personal GitHub repositories (excluding for
 
 The remote repository is automatically created on Codeberg if it doesn't exist yet, then synchronized via a full Git mirror (all branches + tags).
 
+GitHub releases (metadata and assets) are also synchronized to Codeberg.
+
 ## Requirements
 
 - [`gh`](https://cli.github.com/) authenticated (`gh auth login`)
@@ -34,6 +36,9 @@ Fill in `.env`:
 
 # Full synchronization
 ./bin/sync-github-to-codeberg.sh
+
+# Synchronize only specific repositories (can be repeated)
+./bin/sync-github-to-codeberg.sh --repo owner/repo1 --repo owner/repo2
 ```
 
 The script is **re-runnable**: repositories already present on Codeberg are not recreated, only their content is updated (branches + tags).
@@ -43,6 +48,20 @@ If a GitHub repository is archived, the corresponding Codeberg repository is una
 If it is already archived on the Codeberg side for another reason, it is also unarchived before syncing.
 
 If one or more repositories fail, the script continues with the remaining ones and prints a final summary (non-zero exit code if any failures occurred).
+
+### Release synchronization
+
+GitHub releases are replicated to Codeberg after each repository's mirror push:
+
+- release metadata (name, body, prerelease flag) is created or updated on Codeberg to match GitHub.
+- draft releases are skipped.
+- release assets are downloaded from GitHub and re-uploaded to Codeberg; assets already present (matched by name) are skipped.
+- releases present on Codeberg but no longer on GitHub are deleted, as are their orphaned assets.
+
+This is controlled via two environment variables in `.env` (both default to `true`):
+
+- `SYNC_RELEASES` — enable/disable release metadata synchronization entirely.
+- `SYNC_RELEASE_ASSETS` — enable/disable asset synchronization (has no effect if `SYNC_RELEASES=false`).
 
 ## Configuring local clones to push to both remotes
 

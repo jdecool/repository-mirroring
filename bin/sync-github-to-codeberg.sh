@@ -259,14 +259,15 @@ fetch_github_releases() {
     local page_releases
     page_releases="$(jq '[.[] | select(.draft == false)]' <<<"$response")"
     all_releases="$(jq --argjson existing "$all_releases" --argjson new "$page_releases" '$existing + $new' <<<"$all_releases")"
-    
-    # Check if there are more pages
-    local link_header
-    link_header="$(gh_api HEAD "/repos/${owner}/${repo}/releases?per_page=${per_page}&page=${page}" 2>/dev/null | grep -i 'link:' | head -1 || true)"
-    if [[ -z "$link_header" || "$link_header" != *"rel=\"next\""* ]]; then
+
+    # Check if there are more pages (based on the raw page size, before draft
+    # filtering, so a page containing drafts doesn't stop pagination early)
+    local raw_count
+    raw_count="$(jq 'length' <<<"$response")"
+    if [[ "$raw_count" -lt "$per_page" ]]; then
       break
     fi
-    
+
     page=$((page + 1))
   done
   
@@ -602,39 +603,34 @@ upload_codeberg_asset() {
     return 0
   fi
   
-  local status
-  # Note: Forgejo/Codeberg uses different endpoint for asset upload
-  # It's POST /repos/{owner}/{repo}/releases/{id}/assets with multipart form
-  # But the asset name needs to be in the URL as a query parameter
-  
-  # First, try the standard way - some Forgejo versions use different endpoints
-  # Try: POST /repos/{owner}/{repo}/releases/{id}/assets?name={name}
-  local url="${CODEBERG_API}/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}/assets?name=${asset_name}"
-  
-  status="$(curl -s -w '%{http_code}' \
+  local encoded_name url status fallback_status
+  encoded_name="$(jq -rn --arg n "$asset_name" '$n|@uri')"
+  url="${CODEBERG_API}/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}/assets?name=${encoded_name}"
+
+  # Forgejo accepts a raw octet-stream body when the name is given as a query parameter.
+  status="$(curl -s -o "$WORKDIR/cb_resp_body.json" -w '%{http_code}' \
+    -X POST \
     -H "Authorization: token ${CODEBERG_TOKEN}" \
     -H "Content-Type: application/octet-stream" \
     --data-binary "@${file_path}" \
     "$url")"
-  
-  if [[ "$status" == "201" ]]; then
+
+  if [[ "$status" == "201" || "$status" == "200" ]]; then
     return 0
   fi
-  
-  # If that didn't work, try without the name parameter
-  # Some versions expect the filename from the Content-Disposition header
-  status="$(curl -s -w '%{http_code}' \
+
+  # Fallback for older Forgejo versions that only accept multipart/form-data.
+  fallback_status="$(curl -s -o "$WORKDIR/cb_resp_body.json" -w '%{http_code}' \
+    -X POST \
     -H "Authorization: token ${CODEBERG_TOKEN}" \
-    -H "Content-Type: application/octet-stream" \
-    -H "Content-Disposition: attachment; filename=\"${asset_name}\"" \
-    --data-binary "@${file_path}" \
-    "${CODEBERG_API}/repos/${CODEBERG_USER}/${repo_name}/releases/${release_id}/assets")"
-  
-  if [[ "$status" == "201" ]]; then
+    -F "attachment=@${file_path};filename=${asset_name}" \
+    "$url")"
+
+  if [[ "$fallback_status" == "201" || "$fallback_status" == "200" ]]; then
     return 0
   fi
-  
-  err "  Failed to upload asset '$asset_name' (HTTP $status)"
+
+  err "  Failed to upload asset '$asset_name' (HTTP $status, fallback HTTP $fallback_status): $(redact "$(cat "$WORKDIR/cb_resp_body.json")")"
   return 1
 }
 
