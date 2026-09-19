@@ -1,10 +1,10 @@
 # Codeberg mirroring
 
-Bash script to replicate all of your personal GitHub repositories (excluding forks and organization repositories — private and archived ones included) to [Codeberg](https://codeberg.org).
+Bash scripts to replicate all of your personal GitHub repositories (excluding forks and organization repositories - private and archived ones included) to [Codeberg](https://codeberg.org) and/or [rickub](https://rickub.com).
 
-The remote repository is automatically created on Codeberg if it doesn't exist yet, then synchronized via a full Git mirror (all branches + tags).
+The remote repository is automatically created on the destination if it doesn't exist yet, then synchronized via a full Git mirror (all branches + tags).
 
-GitHub releases (metadata and assets) are also synchronized to Codeberg.
+GitHub releases (metadata and assets) are also synchronized.
 
 ## Requirements
 
@@ -19,13 +19,17 @@ cp .env.example .env
 
 Fill in `.env`:
 
-- `CODEBERG_TOKEN` — Codeberg API token with the `repository` scope
+- `CODEBERG_TOKEN` - Codeberg API token with the `repository` scope
   (create one at https://codeberg.org/user/settings/applications)
-- `CODEBERG_USER` — your Codeberg username
-- `GITHUB_TOKEN` — optional, otherwise the script uses `gh auth token`
-- `GITHUB_USER` — your GitHub username (used by `bin/configure-git-remote-mirroring.sh`)
+- `CODEBERG_USER` - your Codeberg username
+- `RICKUB_TOKEN` - rickub personal access token (create one at https://rickub.com/settings/tokens, Full access required)
+- `RICKUB_USER` - your rickub username (handle)
+- `GITHUB_TOKEN` - optional, otherwise the script uses `gh auth token`
+- `GITHUB_USER` - your GitHub username (used by `bin/configure-git-remote-mirroring.sh`)
 
 ## Usage
+
+### Sync to Codeberg
 
 ```sh
 # Dry run, without changing anything
@@ -41,15 +45,35 @@ Fill in `.env`:
 ./bin/sync-github-to-codeberg.sh --repo owner/repo1 --repo owner/repo2
 ```
 
-The script is **re-runnable**: repositories already present on Codeberg are not recreated, only their content is updated (branches + tags).
+### Sync to rickub
+
+```sh
+# Dry run, without changing anything
+./bin/sync-github-to-rickub.sh --dry-run
+
+# Real test limited to 2 repositories
+./bin/sync-github-to-rickub.sh --limit 2
+
+# Full synchronization
+./bin/sync-github-to-rickub.sh
+
+# Synchronize only specific repositories (can be repeated)
+./bin/sync-github-to-rickub.sh --repo owner/repo1 --repo owner/repo2
+```
+
+Both scripts are **re-runnable**: repositories already present on the destination are not recreated, only their content is updated (branches + tags).
 
 If a GitHub repository is archived, the corresponding Codeberg repository is unarchived for the duration of the update and re-archived afterward (an archived repository refuses pushes).
 
 If it is already archived on the Codeberg side for another reason, it is also unarchived before syncing.
 
+The rickub script does not manage archiving (not supported by the rickub API).
+
 If one or more repositories fail, the script continues with the remaining ones and prints a final summary (non-zero exit code if any failures occurred).
 
 ### Release synchronization
+
+#### Codeberg
 
 GitHub releases are replicated to Codeberg after each repository's mirror push:
 
@@ -60,8 +84,20 @@ GitHub releases are replicated to Codeberg after each repository's mirror push:
 
 This is controlled via two environment variables in `.env` (both default to `true`):
 
-- `SYNC_RELEASES` — enable/disable release metadata synchronization entirely.
-- `SYNC_RELEASE_ASSETS` — enable/disable asset synchronization (has no effect if `SYNC_RELEASES=false`).
+- `SYNC_RELEASES` - enable/disable release metadata synchronization entirely.
+- `SYNC_RELEASE_ASSETS` - enable/disable asset synchronization (has no effect if `SYNC_RELEASES=false`).
+
+#### rickub
+
+GitHub release metadata (name, body, prerelease flag) is replicated to rickub after each repository's mirror push:
+
+- release metadata is created or updated on rickub to match GitHub.
+- draft releases are skipped.
+- releases present on rickub but no longer on GitHub are deleted.
+- release assets are not synchronized (not confirmed in the rickub API).
+
+This is controlled via the `SYNC_RELEASES` environment variable in `.env` (defaults to `true`).
+The `SYNC_RELEASE_ASSETS` variable has no effect for rickub.
 
 ## Configuring local clones to push to both remotes
 
