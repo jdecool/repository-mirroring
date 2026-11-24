@@ -123,7 +123,6 @@ load_dest_profile() {
   local dest="$1"
   case "$dest" in
     codeberg)
-      DEST_KEY="codeberg"
       DEST_NAME="Codeberg"
       DEST_API="${CODEBERG_API:-https://codeberg.org/api/v1}"
       DEST_GIT_HOST="codeberg.org"
@@ -135,10 +134,10 @@ load_dest_profile() {
       DEST_NEEDS_RELEASES_ENABLED=true
       DEST_CREATE_ENDPOINT="user/repos"
       DEST_VISIBILITY_FORMAT="boolean"
+      DEST_RELEASE_FORMAT="gitea"
       DEST_RELEASES_PER_PAGE=100
       ;;
     rickub)
-      DEST_KEY="rickub"
       DEST_NAME="rickub"
       DEST_API="${RICKUB_API:-https://rickub.com/api/v1}"
       DEST_GIT_HOST="${RICKUB_GIT_HOST:-git.rickub.com}"
@@ -150,6 +149,8 @@ load_dest_profile() {
       DEST_NEEDS_RELEASES_ENABLED=false
       DEST_CREATE_ENDPOINT="repos"
       DEST_VISIBILITY_FORMAT="string"
+      # rickub names release fields tag/title instead of Gitea's tag_name/name
+      DEST_RELEASE_FORMAT="rickub"
       DEST_RELEASES_PER_PAGE=50
       ;;
     *)
@@ -444,6 +445,10 @@ fetch_dest_releases() {
     if [[ "$status" == "200" ]]; then
       local page_releases
       page_releases="$(cat "$WORKDIR/resp_body.json")"
+      # Normalize to Gitea field names so sync_releases stays destination-agnostic
+      if [[ "$DEST_RELEASE_FORMAT" == "rickub" ]]; then
+        page_releases="$(jq 'map(. + {tag_name: .tag, name: .title})' <<<"$page_releases")"
+      fi
       all_releases="$(jq --argjson existing "$all_releases" --argjson new "$page_releases" '$existing + $new' <<<"$all_releases")"
 
       local count
@@ -478,6 +483,9 @@ create_dest_release() {
     --arg body "$body" \
     --argjson prerelease "$prerelease" \
     '{tag_name: $tag_name, name: $name, body: $body, prerelease: $prerelease}')"
+  if [[ "$DEST_RELEASE_FORMAT" == "rickub" ]]; then
+    payload="$(jq '{tag: .tag_name, title: .name, body, prerelease}' <<<"$payload")"
+  fi
 
   local status
   status="$(dest_api_status POST "/repos/${DEST_USER}/${repo_name}/releases" \
@@ -510,6 +518,9 @@ update_dest_release() {
     --arg body "$body" \
     --argjson prerelease "$prerelease" \
     '{name: $name, body: $body, prerelease: $prerelease}')"
+  if [[ "$DEST_RELEASE_FORMAT" == "rickub" ]]; then
+    payload="$(jq '{title: .name, body, prerelease}' <<<"$payload")"
+  fi
 
   local status
   status="$(dest_api_status PATCH "/repos/${DEST_USER}/${repo_name}/releases/${release_id}" \
@@ -639,8 +650,6 @@ sync_release_assets() {
   dest_asset_names="$(jq -r '[.[].name] | unique | .[]' <<<"$dest_assets" 2>/dev/null || echo "")"
 
   # Process each GitHub asset
-  local gh_asset_count
-  gh_asset_count="$(jq 'length' <<<"$gh_assets")"
   local processed=0
 
   while IFS= read -r gh_asset; do
@@ -916,7 +925,8 @@ sync_releases() {
 
     # Mark this tag as processed
     dest_by_tag="$(jq --arg tag "$tag_name" 'del(.[$tag])' <<<"$dest_by_tag")"
-  done < <(jq -c '.[]' <<<"$gh_releases")
+  # Oldest first: destinations flag the most recently created release as "latest"
+  done < <(jq -c 'sort_by(.published_at // .created_at) | .[]' <<<"$gh_releases")
 
   # Second pass: delete orphaned releases on destination
   # dest_by_tag now contains only releases not on GitHub
