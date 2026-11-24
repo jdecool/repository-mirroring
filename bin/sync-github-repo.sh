@@ -25,6 +25,10 @@
 # Usage:
 #   ./sync-github-repo.sh [--dry-run] [--limit N] [--repo owner/repo]...
 #                            [--dest codeberg] [--dest rickub]...
+#                            [--oldest-first]
+#
+# --oldest-first processes repositories by last push date, oldest first
+# (applied before --limit).
 #
 # If --dest is not specified, all configured destinations (those whose
 # tokens and usernames are present in .env) are used automatically.
@@ -40,6 +44,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # ---------------------------------------------------------------------------
 DRY_RUN=0
 LIMIT=0
+OLDEST_FIRST=0
 REPOS=()
 DESTS=()
 
@@ -52,6 +57,10 @@ while [[ $# -gt 0 ]]; do
     --limit)
       LIMIT="${2:?"--limit requires a value"}"
       shift 2
+      ;;
+    --oldest-first)
+      OLDEST_FIRST=1
+      shift
       ;;
     --repo)
       REPOS+=("${2:?"--repo requires a value"}")
@@ -248,7 +257,7 @@ if [[ ${#REPOS[@]} -gt 0 ]]; then
   repos_json="[]"
   for repo_spec in "${REPOS[@]}"; do
     repo_json="$(gh repo view "$repo_spec" \
-      --json nameWithOwner,name,isFork,isArchived,isPrivate,description 2>/dev/null || true)"
+      --json nameWithOwner,name,isFork,isArchived,isPrivate,description,pushedAt 2>/dev/null || true)"
     if [[ -z "$repo_json" ]]; then
       err "Repository '$repo_spec' not found or inaccessible"
       exit 1
@@ -257,11 +266,16 @@ if [[ ${#REPOS[@]} -gt 0 ]]; then
   done
 else
   repos_json="$(gh repo list --source --limit 1000 \
-    --json nameWithOwner,name,isFork,isArchived,isPrivate,description)"
+    --json nameWithOwner,name,isFork,isArchived,isPrivate,description,pushedAt)"
 fi
 
 # Safety filter (gh --source should already exclude forks)
 filtered_json="$(jq -c '[.[] | select(.isFork == false)]' <<<"$repos_json")"
+
+# Sorted before --limit so "--oldest-first --limit N" picks the N stalest repos
+if [[ "$OLDEST_FIRST" -eq 1 ]]; then
+  filtered_json="$(jq -c 'sort_by(.pushedAt)' <<<"$filtered_json")"
+fi
 total="$(jq 'length' <<<"$filtered_json")"
 
 if [[ "$LIMIT" -gt 0 && "$LIMIT" -lt "$total" ]]; then

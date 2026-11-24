@@ -47,6 +47,9 @@ Fill in `.env`:
 # Sync to both Codeberg and rickub in a single pass
 ./bin/sync-github-repo.sh --dest=codeberg --dest=rickub
 
+# Process repositories by last push date, oldest first (applied before --limit)
+./bin/sync-github-repo.sh --oldest-first --limit 10
+
 # Synchronize only specific repositories (can be repeated)
 ./bin/sync-github-repo.sh --repo owner/repo1 --repo owner/repo2
 ```
